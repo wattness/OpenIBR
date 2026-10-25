@@ -1,0 +1,154 @@
+name: Fork-only AC extrema Linux GCC verification
+on:
+  push:
+    branches:
+      - verification/ac-extrema-linux-gcc-20261025
+permissions:
+  contents: read
+jobs:
+  gcc-ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify existing tools and pinned original/fixed component
+        shell: bash
+        run: |
+          /usr/bin/python3 -B - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import signal
+          import subprocess
+          import sys
+
+          PIN = "ac9ebdbefb2edd1049b46d65aa318ba315531355"
+          BASELINE = "5e2396cef8e57765c6a8fefe34fc379c3a60c163"
+          root = Path.cwd()
+          evidence = root / "linux-evidence"
+          evidence.mkdir(exist_ok=False)
+          record = {"status": "preflight", "source_commit": PIN, "baseline_commit": BASELINE,
+                    "platform": platform.platform(), "machine": platform.machine(),
+                    "os_release": Path("/etc/os-release").read_text(),
+                    "hosted_runner": {key: os.environ.get(key) for key in
+                                      ("ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_REPOSITORY")},
+                    "commands": [], "dependency_installation": False,
+                    "cross_platform_byte_comparison": False, "controller_or_criteria_modified": False}
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def save():
+              (evidence / "execution.json").write_text(json.dumps(record, indent=2) + "\n")
+
+          def run(argv, label, timeout=90):
+              command = {"argv": list(map(str, argv)), "cwd": str(root), "label": label,
+                         "started_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         "timed_out": False, "interrupted": False, "timeout_seconds": timeout}
+              record["commands"].append(command)
+              save()
+              process = None
+              try:
+                  with (evidence / (label + ".stdout")).open("wb") as stdout, (evidence / (label + ".stderr")).open("wb") as stderr:
+                      process = subprocess.Popen(argv, cwd=root, stdout=stdout, stderr=stderr, start_new_session=True,
+                                                 env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1"))
+                      command["pid"] = process.pid
+                      try:
+                          process.wait(timeout=timeout)
+                      except subprocess.TimeoutExpired:
+                          command["timed_out"] = True
+                      except KeyboardInterrupt:
+                          command["interrupted"] = True
+                          raise
+                      finally:
+                          if process.poll() is None:
+                              # Let the component runner stop its separate command group and save evidence.
+                              try:
+                                  os.killpg(process.pid, signal.SIGTERM)
+                              except ProcessLookupError:
+                                  pass
+                              try:
+                                  process.wait(timeout=5)
+                              except subprocess.TimeoutExpired:
+                                  pass
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+              finally:
+                  command.update(exit_code=process.returncode if process is not None else None,
+                                 ended_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                  for stream in ("stdout", "stderr"):
+                      path = evidence / (label + "." + stream)
+                      if path.exists():
+                          command[stream] = path.name
+                          command[stream + "_sha256"] = sha(path)
+                  save()
+              if command["timed_out"]:
+                  raise RuntimeError("Timed out: " + label)
+              return process.returncode
+
+          def terminate(signum, frame):
+              raise KeyboardInterrupt(f"Signal {signum}")
+
+          signal.signal(signal.SIGTERM, terminate)
+
+          try:
+              save()
+              gcc, git = shutil.which("gcc"), shutil.which("git")
+              if not gcc or not git:
+                  raise RuntimeError("Existing GCC and Git are required; nothing will be installed")
+              if run([gcc, "--version"], "gcc-version"):
+                  raise RuntimeError("Existing GCC unavailable")
+              selected = None
+              candidates = ["/usr/bin/python3", "/opt/pipx/venvs/yamllint/bin/python"]
+              for index, python in enumerate(candidates):
+                  if not Path(python).exists():
+                      continue
+                  probe = "import json,sys,yaml; print(json.dumps({'python':sys.version,'pyyaml':yaml.__version__,'executable':sys.executable}))"
+                  if run([python, "-I", "-B", "-c", probe], "python-probe-" + str(index)) == 0:
+                      selected = python
+                      record["python"] = json.loads((evidence / ("python-probe-" + str(index) + ".stdout")).read_text())
+                      break
+              if selected is None:
+                  raise RuntimeError("No existing isolated Python/PyYAML environment is available; no install attempted")
+              record["gcc"] = {"path": gcc, "sha256": sha(gcc)}
+              source = root / "pinned-source"
+              for argv, label in [([git, "init", "-q", str(source)], "git-init"),
+                                  ([git, "-C", str(source), "-c", "credential.helper=", "fetch", "--no-tags",
+                                    "https://github.com/wattness/OpenIBR.git", PIN, BASELINE], "git-fetch-pinned"),
+                                  ([git, "-C", str(source), "checkout", "--detach", PIN], "git-checkout-pinned")]:
+                  if run(argv, label):
+                      raise RuntimeError("Pinned source preparation failed: " + label)
+              runner = source / "validation/c/ac_checks_A/run_regression.py"
+              record["runner_sha256"] = sha(runner)
+              record["harness_sha256"] = sha(runner.with_name("harness.c"))
+              regression = evidence / "regression with spaces"
+              code = run([selected, "-B", str(runner), "--cc", gcc, "--output-dir", str(regression)], "component-regression", timeout=420)
+              if code:
+                  raise RuntimeError("Component regression failed; inspect retained manifest and logs")
+              manifest = json.loads((regression / "manifest.json").read_text())
+              record["summary"] = manifest["summary"]
+              record["regression_manifest_sha256"] = sha(regression / "manifest.json")
+              record["status"] = "passed"
+              save()
+              print(json.dumps({"status": "passed", "summary": record["summary"], "gcc_path": gcc, "python": record["python"]}, sort_keys=True))
+          except (Exception, KeyboardInterrupt) as error:
+              record.update(status="failed", error=str(error) or type(error).__name__)
+              save()
+              print(str(error), file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Retain actual execution inputs, manifests and raw logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ac-extrema-linux-gcc-${{ github.run_id }}
+          path: linux-evidence/
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
