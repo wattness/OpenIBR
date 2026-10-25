@@ -10,8 +10,14 @@ Use Python 3.10 or later, existing PyYAML 6 or later, and an existing C99-capabl
 Clang/GCC compiler. Dependency checks install or activate nothing. The runner
 uses the same isolated Python interpreter for checking PyYAML and generating
 headers. Local validation used Python 3.12, PyYAML 6.0.2 and Apple clang 21 on
-macOS arm64. Linux execution and Windows/MSVC have not been validated here;
-this version targets POSIX Clang/GCC and rejects Windows.
+macOS arm64. The same default smoke passed on Ubuntu 24.04.5/x86_64 with GNU
+GCC 13.3.0, preinstalled Python 3.12.3 and PyYAML 6.0.1 in a
+[fork-only Linux run](https://github.com/wattness/OpenIBR/actions/runs/40227077985).
+That run retained 14 trajectories and 171,570 actual calls: ten finite controls
+passed and four malformed-input cases remained observations. Its thin launcher
+maps SIGTERM to Python interruption for the runner's existing cleanup path;
+the runner, controller, case design and source/header pins were unchanged.
+Windows/MSVC is unsupported; this version targets POSIX Clang/GCC.
 
 From the checkout root:
 
