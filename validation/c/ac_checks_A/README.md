@@ -55,4 +55,10 @@ delays at a 1-ms call interval. These are test timings, not protection settings.
 Negative phase values test signed arithmetic, not valid RMS measurements.
 Timer checks allow 1e-7 s for float rounding. Windows DLL loading, Simulink,
 blackstart permission and full electrical behavior are outside these tests.
-Validated on macOS with Apple Clang 21.0.0; other platforms are unverified.
+Validated on macOS/arm64 with Apple Clang 21.0.0, and Ubuntu 24.04.5/x86_64
+with GNU GCC 13.3.0 in a [fork-only Linux run](https://github.com/wattness/OpenIBR/actions/runs/40224300793).
+The Linux run used preinstalled Python 3.12.3/PyYAML 6.0.1 and the same
+regression criteria; no dependencies were installed. The 15 observed-state
+controls compare original and fixed builds within each platform. Binary or
+trace byte identity between platforms is not an acceptance criterion.
+Other platforms remain unverified.
