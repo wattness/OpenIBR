@@ -1,0 +1,173 @@
+name: Fork-only battery host-input Linux GCC smoke
+on:
+  push:
+    branches:
+      - verification/host-input-linux-gcc-20261025
+permissions:
+  contents: read
+jobs:
+  gcc-ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Verify existing tools and pinned host-input characterization
+        shell: bash
+        run: |
+          /usr/bin/python3 -B - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import signal
+          import subprocess
+          import sys
+
+          PIN = "2171a4024e3b2b1809356cb04687e4b9cecae0e2"
+          BASELINE = "5e2396cef8e57765c6a8fefe34fc379c3a60c163"
+          LAUNCHER = '"""Translate orchestrator SIGTERM into the pinned runner\'s supported interruption path."""\nimport runpy\nimport signal\nimport sys\n\ndef terminate(signum, frame):\n    raise KeyboardInterrupt(f"Signal {signum}")\n\nsignal.signal(signal.SIGTERM, terminate)\nrunner = sys.argv[1]\nsys.argv = sys.argv[1:]\nrunpy.run_path(runner, run_name="__main__")\n'
+          root = Path.cwd()
+          evidence = root / "host-linux-evidence"
+          evidence.mkdir(exist_ok=False)
+          record = {"status": "preflight", "source_commit": PIN, "baseline_commit": BASELINE,
+                    "platform": platform.platform(), "machine": platform.machine(),
+                    "os_release": Path("/etc/os-release").read_text(),
+                    "hosted_runner": {key: os.environ.get(key) for key in
+                                      ("ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_RUN_ID", "GITHUB_SHA", "GITHUB_REPOSITORY")},
+                    "commands": [], "dependency_installation": False,
+                    "cross_platform_byte_comparison": False, "controller_or_criteria_modified": False, "original_voltage_extrema_defect_retained": True,
+                    "malformed_input_safety_verdict": False, "full_36_case_campaign": False}
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def save():
+              (evidence / "execution.json").write_text(json.dumps(record, indent=2) + "\n")
+
+          def run(argv, label, timeout=90):
+              command = {"argv": list(map(str, argv)), "cwd": str(root), "label": label,
+                         "started_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                         "timed_out": False, "interrupted": False, "timeout_seconds": timeout}
+              record["commands"].append(command)
+              save()
+              process = None
+              try:
+                  with (evidence / (label + ".stdout")).open("wb") as stdout, (evidence / (label + ".stderr")).open("wb") as stderr:
+                      process = subprocess.Popen(argv, cwd=root, stdout=stdout, stderr=stderr, start_new_session=True,
+                                                 env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1"))
+                      command["pid"] = process.pid
+                      try:
+                          process.wait(timeout=timeout)
+                      except subprocess.TimeoutExpired:
+                          command["timed_out"] = True
+                      except KeyboardInterrupt:
+                          command["interrupted"] = True
+                          raise
+                      finally:
+                          if process.poll() is None:
+                              # Let the launcher turn SIGTERM into the pinned runner's supported KeyboardInterrupt cleanup.
+                              try:
+                                  os.killpg(process.pid, signal.SIGTERM)
+                              except ProcessLookupError:
+                                  pass
+                              try:
+                                  process.wait(timeout=5)
+                              except subprocess.TimeoutExpired:
+                                  pass
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait()
+              finally:
+                  command.update(exit_code=process.returncode if process is not None else None,
+                                 ended_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                  for stream in ("stdout", "stderr"):
+                      path = evidence / (label + "." + stream)
+                      if path.exists():
+                          command[stream] = path.name
+                          command[stream + "_sha256"] = sha(path)
+                  save()
+              if command["timed_out"]:
+                  raise RuntimeError("Timed out: " + label)
+              return process.returncode
+
+          def terminate(signum, frame):
+              raise KeyboardInterrupt(f"Signal {signum}")
+
+          signal.signal(signal.SIGTERM, terminate)
+
+          try:
+              save()
+              gcc, git = shutil.which("gcc"), shutil.which("git")
+              if not gcc or not git:
+                  raise RuntimeError("Existing GCC and Git are required; nothing will be installed")
+              if run([gcc, "--version"], "gcc-version"):
+                  raise RuntimeError("Existing GCC unavailable")
+              selected = None
+              candidates = ["/usr/bin/python3", "/opt/pipx/venvs/yamllint/bin/python"]
+              for index, python in enumerate(candidates):
+                  if not Path(python).exists():
+                      continue
+                  probe = "import json,sys,yaml; assert sys.version_info >= (3,10); assert int(yaml.__version__.split('.')[0]) >= 6; print(json.dumps({'python':sys.version,'pyyaml':yaml.__version__,'executable':sys.executable}))"
+                  if run([python, "-I", "-B", "-c", probe], "python-probe-" + str(index)) == 0:
+                      selected = python
+                      record["python"] = json.loads((evidence / ("python-probe-" + str(index) + ".stdout")).read_text())
+                      break
+              if selected is None:
+                  raise RuntimeError("No existing isolated Python/PyYAML environment is available; no install attempted")
+              record["gcc"] = {"path": gcc, "sha256": sha(gcc)}
+              source = root / "pinned-source"
+              for argv, label in [([git, "init", "-q", str(source)], "git-init"),
+                                  ([git, "-C", str(source), "-c", "credential.helper=", "fetch", "--no-tags",
+                                    "https://github.com/wattness/OpenIBR.git", PIN, BASELINE], "git-fetch-pinned"),
+                                  ([git, "-C", str(source), "checkout", "--detach", PIN], "git-checkout-pinned")]:
+                  if run(argv, label):
+                      raise RuntimeError("Pinned source preparation failed: " + label)
+              runner = source / "validation/c/host_input_characterization/run.py"
+              record["runner_sha256"] = sha(runner)
+              record["harness_sha256"] = sha(runner.with_name("harness.c"))
+              record["case_design_sha256"] = sha(runner.with_name("CASES.json"))
+              record["source_pins_sha256"] = sha(runner.with_name("SOURCE-PINS.json"))
+              for arguments, label in [(["--source-dir", str(source), "--check-inputs"], "check-source-pins"),
+                                       (["--source-dir", str(source), "--cc", gcc, "--preflight"], "runner-preflight")]:
+                  if run([selected, "-I", "-B", str(runner), *arguments], label):
+                      raise RuntimeError("Pinned kit preflight failed: " + label)
+              launcher = evidence / "runner_launcher.py"
+              launcher.write_text(LAUNCHER)
+              record["launcher_sha256"] = sha(launcher)
+              smoke = evidence / "smoke with spaces"
+              code = run([selected, "-I", "-B", str(launcher), str(runner), "--source-dir", str(source),
+                          "--cc", gcc, "--suite", "smoke", "--output-dir", str(smoke)], "host-input-smoke", timeout=600)
+              if code:
+                  raise RuntimeError("Host-input smoke failed; inspect retained manifest and logs")
+              manifest = json.loads((smoke / "manifest.json").read_text())
+              expected = {"trajectory_processes": 14, "controller_calls": 171570,
+                          "finite_control_cases_passed": 10, "behavior_only_cases_observed": 4,
+                          "matched_comparisons": 13, "recovery_window_seconds": 0.05,
+                          "full_36_case_campaign": False, "numeric_policy_or_safety_verdict": False}
+              if manifest["status"] != "completed_characterization" or manifest["summary"] != expected:
+                  raise RuntimeError("Unexpected frozen smoke coverage/integrity summary")
+              record["summary"] = manifest["summary"]
+              record["manifest_sha256"] = sha(smoke / "manifest.json")
+              record["comparisons_sha256"] = sha(smoke / "comparisons.json")
+              record["status"] = "passed"
+              save()
+              print(json.dumps({"status": "passed", "summary": record["summary"], "gcc_path": gcc, "python": record["python"]}, sort_keys=True))
+          except (Exception, KeyboardInterrupt) as error:
+              record.update(status="failed", error=str(error) or type(error).__name__)
+              save()
+              print(str(error), file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Retain actual inputs, outputs, returns, catalog snapshots and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: host-input-linux-gcc-${{ github.run_id }}
+          path: host-linux-evidence/
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
